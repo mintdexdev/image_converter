@@ -2,15 +2,14 @@ import fs from "fs";
 import path from "path";
 import sharp from "sharp";
 
-// Use 1 thread per image so the 4 concurrent workers don't fight for resources
 sharp.concurrency(1);
 
 const inputDir = "source";
-const outputDir = "oneMbImages";
+const outputDir = "limitedSizeOutput";
 const CONCURRENCY_LIMIT = 4;
 const MAX_SIZE_BYTES = 900 * 1024; // 900 KB
-const HIGHEST_QUALITY = 80;
-const DECREMENT = 5; //decrement of
+const HIGHEST_QUALITY = 90;
+const DECREMENT = 10;
 
 fs.mkdirSync(outputDir, { recursive: true });
 
@@ -25,11 +24,12 @@ let pendingFiles = fs
 
 async function processBatch(files, quality) {
   console.log(
-    `\n--- 🏁 Starting Pass: Quality ${quality}% (${files.length} images) ---`
+    `\n--- Pass: Quality ${quality}% | Processing ${files.length} images ---`
   );
 
   const queue = [...files];
   const nextPassQueue = [];
+  let completedInThisPass = 0;
 
   const workers = Array(CONCURRENCY_LIMIT)
     .fill(null)
@@ -39,18 +39,16 @@ async function processBatch(files, quality) {
         if (!fileObj) continue;
 
         try {
-          // PASS 1 ONLY: If original is already < 900KB, just copy it
+          // PASS 1: Copy if already small enough
           if (quality === HIGHEST_QUALITY) {
             const sourceStats = fs.statSync(fileObj.inputPath);
             if (sourceStats.size < MAX_SIZE_BYTES) {
-              // Copy instead of skip, so the output folder is complete
               fs.copyFileSync(fileObj.inputPath, fileObj.outputPath);
-              console.log(`⏩ Copying (Already small): ${fileObj.name}`);
+              completedInThisPass++;
               continue;
             }
           }
 
-          // Convert/Compress
           await sharp(fileObj.inputPath)
             .jpeg({
               quality: quality,
@@ -60,16 +58,11 @@ async function processBatch(files, quality) {
             })
             .toFile(fileObj.outputPath);
 
-          // Validation
           const resultStats = fs.statSync(fileObj.outputPath);
           if (resultStats.size > MAX_SIZE_BYTES) {
-            nextPassQueue.push(fileObj); // Push to next pass
+            nextPassQueue.push(fileObj);
           } else {
-            console.log(
-              `✅ Success: ${fileObj.name} (${(resultStats.size / 1024).toFixed(
-                1
-              )} KB)`
-            );
+            completedInThisPass++;
           }
         } catch (err) {
           console.error(`❌ Error ${fileObj.name}: ${err.message}`);
@@ -78,11 +71,14 @@ async function processBatch(files, quality) {
     });
 
   await Promise.all(workers);
+
+  console.log(`Summary: ${completedInThisPass} files optimized below 900KB.`);
   return nextPassQueue;
 }
 
 async function run() {
-  if (pendingFiles.length === 0) {
+  const totalFiles = pendingFiles.length;
+  if (totalFiles === 0) {
     console.log("❌ No compatible images found.");
     return;
   }
@@ -92,28 +88,36 @@ async function run() {
   let currentQuality = HIGHEST_QUALITY;
   let currentQueue = pendingFiles;
 
-  // Pass-by-pass loop
-  while (currentQueue.length > 0 && currentQuality >= DECREMENT) {
+  while (currentQueue.length > 0 && currentQuality >= 10) {
     currentQueue = await processBatch(currentQueue, currentQuality);
 
     if (currentQueue.length > 0) {
+      const totalDone = totalFiles - currentQueue.length;
+      console.log(
+        `Progress: ${totalDone}/${totalFiles} total files are now within limits.`
+      );
+
       currentQuality -= DECREMENT;
-      if (currentQuality >= DECREMENT) {
+      if (currentQuality >= 10) {
         console.log(
-          `\n⚠️ ${currentQueue.length} files still over 900KB. Next pass at ${currentQuality}% quality.`
+          `Remaning ${currentQueue.length} files still too large. Retrying with ${currentQuality}% quality...`
         );
       }
     }
   }
 
-  console.log("\n" + "=".repeat(30));
-  // if an image is still > 900KB even at least DECREMENT quality
+  console.log("\n" + "=".repeat(40));
   if (currentQueue.length > 0) {
     console.log(
-      `⚠️ Completed: ${currentQueue.length} images are still > 900KB (reached 10% quality limit).`
+      `⚠️ Finished: ${currentQueue.length} images exceeded 900KB even at 10% quality.`
+    );
+    console.log(
+      `✅ Success: ${
+        totalFiles - currentQueue.length
+      } images are ready in '${outputDir}'`
     );
   } else {
-    console.log("🏁 All tasks complete! All images are now under 900KB.");
+    console.log(`🏁 Success: All ${totalFiles} images are now under 900KB!`);
   }
   console.timeEnd("Total Processing Time");
 }
