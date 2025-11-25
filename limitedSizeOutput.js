@@ -1,125 +1,192 @@
-import fs from "fs";
+import fs from "fs/promises";
+import { existsSync } from "fs";
 import path from "path";
 import sharp from "sharp";
+import os from "os";
 
-sharp.concurrency(1);
+/**
+ * GLOBAL CONFIGURATION
+ */
+const CONFIG = {
+  inputDir: "source",
+  outputDir: "limitedSizeOutput",
+  maxSizeBytes: 900 * 1024, // 900 KB
 
-const inputDir = "source";
-const outputDir = "limitedSizeOutput";
-const CONCURRENCY_LIMIT = 4;
-const MAX_SIZE_BYTES = 900 * 1024; // 900 KB
-const HIGHEST_QUALITY = 90;
-const DECREMENT = 10;
+  concurrencyLimit: Math.max(2, Math.floor(os.cpus().length * 0.75)),
 
-fs.mkdirSync(outputDir, { recursive: true });
+  maxQuality: 90,
+  minQuality: 10,
+  stepGap: 5,
 
-let pendingFiles = fs
-  .readdirSync(inputDir)
-  .filter((f) => /\.(png|jpe?g|heic|heif)$/i.test(f))
-  .map((f) => ({
-    name: f,
-    inputPath: path.join(inputDir, f),
-    outputPath: path.join(outputDir, `${path.parse(f).name}.jpg`),
-  }));
+  probeQuality: 80,
 
-async function processBatch(files, quality) {
-  console.log(
-    `\n--- Pass: Quality ${quality}% | Processing ${files.length} images ---`
+  mozjpeg: true,
+  trellis: true,
+  progressive: true,
+  chromaSubsampling: "4:2:0",
+
+  debug: true,
+};
+
+/**
+ * SHARP HARDWARE SETUP
+ */
+sharp.concurrency(1); // one thread per image
+sharp.simd(true);
+sharp.cache(false);
+
+/**
+ * IMAGE PROCESSOR
+ */
+async function processImage(file) {
+  const inputPath = path.join(CONFIG.inputDir, file);
+  const outputPath = path.join(
+    CONFIG.outputDir,
+    `${path.parse(file).name}.jpg`
   );
 
-  const queue = [...files];
-  const nextPassQueue = [];
-  let completedInThisPass = 0;
+  try {
+    const stats = await fs.stat(inputPath);
 
-  const workers = Array(CONCURRENCY_LIMIT)
-    .fill(null)
-    .map(async () => {
-      while (queue.length > 0) {
-        const fileObj = queue.shift();
-        if (!fileObj) continue;
+    // Fast-path: already small JPG
+    if (
+      stats.size <= CONFIG.maxSizeBytes &&
+      path.extname(file).toLowerCase() === ".jpg"
+    ) {
+      await fs.copyFile(inputPath, outputPath);
+      return "copied";
+    }
 
-        try {
-          // PASS 1: Copy if already small enough
-          if (quality === HIGHEST_QUALITY) {
-            const sourceStats = fs.statSync(fileObj.inputPath);
-            if (sourceStats.size < MAX_SIZE_BYTES) {
-              fs.copyFileSync(fileObj.inputPath, fileObj.outputPath);
-              completedInThisPass++;
-              continue;
-            }
-          }
+    // Load once
+    const inputBuffer = await fs.readFile(inputPath);
 
-          await sharp(fileObj.inputPath)
-            .jpeg({
-              quality: quality,
-              progressive: true,
-              chromaSubsampling: "4:2:0",
-              mozjpeg: true,
-            })
-            .toFile(fileObj.outputPath);
+    // Normalize once (orientation, metadata)
+    const base = sharp(inputBuffer).rotate();
 
-          const resultStats = fs.statSync(fileObj.outputPath);
-          if (resultStats.size > MAX_SIZE_BYTES) {
-            nextPassQueue.push(fileObj);
-          } else {
-            completedInThisPass++;
-          }
-        } catch (err) {
-          console.error(`❌ Error ${fileObj.name}: ${err.message}`);
+    /**
+     * PROBE PASS (skip binary search if possible)
+     */
+    const probeBuffer = await base
+      .clone()
+      .jpeg({
+        quality: CONFIG.probeQuality,
+        progressive: CONFIG.progressive,
+        mozjpeg: CONFIG.mozjpeg,
+        trellisQuantisation: CONFIG.trellis,
+        overshootDequantisation: true,
+        chromaSubsampling: CONFIG.chromaSubsampling,
+      })
+      .toBuffer();
+
+    if (probeBuffer.length <= CONFIG.maxSizeBytes) {
+      await fs.writeFile(outputPath, probeBuffer);
+      return "compressed";
+    }
+
+    /**
+     * BINARY SEARCH
+     */
+    let low = CONFIG.minQuality;
+    let high = CONFIG.maxQuality;
+
+    let bestUnder = null;
+    let bestOver = null;
+    let finalQuality = low;
+
+    while (low <= high) {
+      if (high - low < CONFIG.stepGap) break;
+
+      const mid = Math.floor((low + high) / 2);
+
+      const buffer = await base
+        .clone()
+        .jpeg({
+          quality: mid,
+          progressive: CONFIG.progressive,
+          mozjpeg: CONFIG.mozjpeg,
+          trellisQuantisation: CONFIG.trellis,
+          overshootDequantisation: true,
+          chromaSubsampling: CONFIG.chromaSubsampling,
+        })
+        .toBuffer();
+
+      if (buffer.length <= CONFIG.maxSizeBytes) {
+        bestUnder = buffer;
+        finalQuality = mid;
+        low = mid + 1;
+      } else {
+        if (!bestOver || buffer.length < bestOver.length) {
+          bestOver = buffer;
+          finalQuality = mid;
         }
+        high = mid - 1;
       }
-    });
+    }
 
-  await Promise.all(workers);
+    const finalBuffer = bestUnder ?? bestOver;
 
-  console.log(`Summary: ${completedInThisPass} files optimized below 900KB.`);
-  return nextPassQueue;
+    if (!finalBuffer) {
+      throw new Error("Compression failed");
+    }
+
+    if (CONFIG.debug) {
+      console.log(
+        `DEBUG: ${file} → ${(finalBuffer.length / 1024).toFixed(
+          2
+        )} KB @ ${finalQuality}%`
+      );
+    }
+
+    await fs.writeFile(outputPath, finalBuffer);
+    return "compressed";
+  } catch (err) {
+    console.error(`❌ Error [${file}]: ${err.message}`);
+    return "error";
+  }
 }
 
+/**
+ * WORKER POOL RUNNER
+ */
 async function run() {
-  const totalFiles = pendingFiles.length;
-  if (totalFiles === 0) {
-    console.log("❌ No compatible images found.");
+  if (!existsSync(CONFIG.outputDir)) {
+    await fs.mkdir(CONFIG.outputDir, { recursive: true });
+  }
+
+  const allFiles = await fs.readdir(CONFIG.inputDir);
+  const files = allFiles.filter((f) =>
+    /\.(png|jpe?g|heic|heif|webp)$/i.test(f)
+  );
+
+  if (!files.length) {
+    console.log("❌ No images found.");
     return;
   }
 
+  console.log(
+    `🚀 Processing ${files.length} images with ${CONFIG.concurrencyLimit} workers`
+  );
   console.time("Total Processing Time");
 
-  let currentQuality = HIGHEST_QUALITY;
-  let currentQueue = pendingFiles;
+  const results = { copied: 0, compressed: 0, error: 0 };
 
-  while (currentQueue.length > 0 && currentQuality >= 10) {
-    currentQueue = await processBatch(currentQueue, currentQuality);
-
-    if (currentQueue.length > 0) {
-      const totalDone = totalFiles - currentQueue.length;
-      console.log(
-        `Progress: ${totalDone}/${totalFiles} total files are now within limits.`
-      );
-
-      currentQuality -= DECREMENT;
-      if (currentQuality >= 10) {
-        console.log(
-          `Remaning ${currentQueue.length} files still too large. Retrying with ${currentQuality}% quality...`
-        );
-      }
+  const worker = async () => {
+    while (files.length) {
+      const file = files.shift();
+      if (!file) continue;
+      const status = await processImage(file);
+      results[status]++;
     }
-  }
+  };
 
-  console.log("\n" + "=".repeat(40));
-  if (currentQueue.length > 0) {
-    console.log(
-      `⚠️ Finished: ${currentQueue.length} images exceeded 900KB even at 10% quality.`
-    );
-    console.log(
-      `✅ Success: ${
-        totalFiles - currentQueue.length
-      } images are ready in '${outputDir}'`
-    );
-  } else {
-    console.log(`🏁 Success: All ${totalFiles} images are now under 900KB!`);
-  }
+  await Promise.all(Array.from({ length: CONFIG.concurrencyLimit }, worker));
+
   console.timeEnd("Total Processing Time");
+  console.log(
+    `🏁 Done → Success: ${results.compressed + results.copied}, Errors: ${
+      results.error
+    }`
+  );
 }
 
 run();
